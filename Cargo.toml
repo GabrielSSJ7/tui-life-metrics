@@ -1,0 +1,15 @@
+[package]
+name = "tui-life-metrics"
+version = "0.1.0"
+edition = "2021"
+description = "TUI life metrics: log daily actions, Claude parses them into structured data, dashboard aggregates flexible metrics from local SQLite"
+license = "MIT"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
