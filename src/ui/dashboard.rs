@@ -58,8 +58,8 @@ struct Dashboard {
     table: TableState,
     mode: Mode,
     drill: ListState,
-    /// Id of the entry awaiting delete confirmation, if any.
-    pending_delete: Option<i64>,
+    /// Ids awaiting delete confirmation (one entry, or a whole category), if any.
+    pending_delete: Option<Vec<i64>>,
     /// Channel receiving the reprocess result while a background parse runs.
     reprocess: Option<Receiver<Result<usize>>>,
     spinner: usize,
@@ -170,6 +170,9 @@ impl Dashboard {
     }
 
     fn on_key(&mut self, code: KeyCode) -> Result<()> {
+        if self.pending_delete.is_some() {
+            return self.on_confirm_key(code);
+        }
         match self.mode {
             Mode::Drill => self.on_drill_key(code),
             Mode::Summary => self.on_summary_key(code),
@@ -184,6 +187,7 @@ impl Dashboard {
             KeyCode::Char('m') => self.set_gran(Granularity::Month)?,
             KeyCode::Char('y') => self.set_gran(Granularity::Year)?,
             KeyCode::Char('r') => self.start_reprocess(),
+            KeyCode::Char('X') => self.request_delete_category(),
             KeyCode::Left | KeyCode::Char('h') => self.shift(-1)?,
             KeyCode::Right | KeyCode::Char('l') => self.shift(1)?,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -195,14 +199,13 @@ impl Dashboard {
     }
 
     fn on_drill_key(&mut self, code: KeyCode) -> Result<()> {
-        if self.pending_delete.is_some() {
-            return self.on_confirm_key(code);
-        }
         match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.mode = Mode::Summary,
             KeyCode::Down | KeyCode::Char('j') => self.move_drill(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_drill(-1),
-            KeyCode::Char('x') | KeyCode::Delete => self.pending_delete = self.selected_drill_id(),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                self.pending_delete = self.selected_drill_id().map(|id| vec![id]);
+            }
             KeyCode::Char('r') => {
                 if let Some(id) = self.selected_drill_id() {
                     self.start_reprocess_one(id);
@@ -211,6 +214,15 @@ impl Dashboard {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Queue every entry of the selected category (in the current period) for
+    /// deletion, pending y/n confirmation.
+    fn request_delete_category(&mut self) {
+        let ids: Vec<i64> = self.drill_entries().iter().map(|e| e.id).collect();
+        if !ids.is_empty() {
+            self.pending_delete = Some(ids);
+        }
     }
 
     fn on_confirm_key(&mut self, code: KeyCode) -> Result<()> {
@@ -222,12 +234,14 @@ impl Dashboard {
         Ok(())
     }
 
-    /// Delete the pending entry, reload, and leave the drill if it emptied out.
+    /// Delete every pending entry, reload, and leave the drill if it emptied out.
     fn confirm_delete(&mut self) -> Result<()> {
-        let Some(id) = self.pending_delete.take() else {
+        let Some(ids) = self.pending_delete.take() else {
             return Ok(());
         };
-        self.store.delete(id)?;
+        for id in ids {
+            self.store.delete(id)?;
+        }
         self.reload()?;
         let remaining = self.drill_entries().len();
         if remaining == 0 {
@@ -348,6 +362,14 @@ impl Dashboard {
     }
 
     fn hint_text(&self) -> String {
+        if let Some(ids) = &self.pending_delete {
+            let noun = if ids.len() == 1 {
+                "entrada"
+            } else {
+                "entradas"
+            };
+            return format!("deletar {} {noun}? (y confirma / n cancela)", ids.len());
+        }
         if self.reprocess.is_some() {
             return format!(
                 "{} reprocessando entradas offline com Claude…",
@@ -357,7 +379,7 @@ impl Dashboard {
         match self.mode {
             Mode::Drill => "↑/↓ mover   r reprocessar   x deletar   Esc volta".to_string(),
             Mode::Summary => {
-                let base = "d/w/m/y período   ←/→ navegar   ↑/↓   Enter detalhes   q sair";
+                let base = "d/w/m/y   ←/→   ↑/↓   Enter detalhes   X apagar categoria   q sair";
                 if self.unprocessed_count > 0 {
                     format!("{base}   r reprocessar ({})", self.unprocessed_count)
                 } else {
@@ -413,9 +435,6 @@ impl Dashboard {
     }
 
     fn drill_title(&self) -> String {
-        if self.pending_delete.is_some() {
-            return " deletar entrada selecionada? (y confirma / n cancela) ".to_string();
-        }
         let category = self.selected_category().unwrap_or("");
         format!(" {category} · {} ", self.period.label())
     }
