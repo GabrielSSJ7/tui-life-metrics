@@ -86,6 +86,19 @@ impl Store {
         collect(rows)
     }
 
+    /// Fetch a single entry by id, if it exists.
+    pub fn get(&self, id: i64) -> Result<Option<Entry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, raw_text, category, occurred_on, attributes, note, processed, created_at
+             FROM entries WHERE id=?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], row_to_entry)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
     /// Permanently remove an entry by id. Returns the number of rows deleted.
     pub fn delete(&self, id: i64) -> Result<usize> {
         let removed = self

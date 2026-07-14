@@ -203,6 +203,11 @@ impl Dashboard {
             KeyCode::Down | KeyCode::Char('j') => self.move_drill(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_drill(-1),
             KeyCode::Char('x') | KeyCode::Delete => self.pending_delete = self.selected_drill_id(),
+            KeyCode::Char('r') => {
+                if let Some(id) = self.selected_drill_id() {
+                    self.start_reprocess_one(id);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -234,19 +239,35 @@ impl Dashboard {
         Ok(())
     }
 
-    /// Spawn a background thread that reparses every offline entry via Claude.
+    /// Reprocess all offline entries (summary `r`).
+    fn start_reprocess(&mut self) {
+        if self.unprocessed_count == 0 {
+            return;
+        }
+        self.spawn_reprocess(None);
+    }
+
+    /// Reprocess a single entry by id (drill `r`), reparsing its raw text —
+    /// works on offline items and re-runs Claude on already-parsed ones to fix
+    /// a wrong category.
+    fn start_reprocess_one(&mut self, id: i64) {
+        self.spawn_reprocess(Some(vec![id]));
+    }
+
+    /// Spawn a background thread that reparses entries via Claude. `ids = None`
+    /// means every offline entry; `Some(ids)` targets those specific rows.
     ///
     /// The thread opens its own DB connection (SQLite handles the concurrent
     /// writes) so the UI thread's [`Store`] and event loop stay responsive.
-    fn start_reprocess(&mut self) {
-        if self.reprocess.is_some() || self.unprocessed_count == 0 {
+    fn spawn_reprocess(&mut self, ids: Option<Vec<i64>>) {
+        if self.reprocess.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         let path = self.db_path.clone();
         let parser = Arc::clone(&self.parser);
         thread::spawn(move || {
-            let _ = tx.send(reprocess_all(&path, parser.as_ref()));
+            let _ = tx.send(reprocess(&path, parser.as_ref(), ids));
         });
         self.reprocess = Some(rx);
         self.spinner = 0;
@@ -334,7 +355,7 @@ impl Dashboard {
             );
         }
         match self.mode {
-            Mode::Drill => "↑/↓ mover   x deletar   Esc volta".to_string(),
+            Mode::Drill => "↑/↓ mover   r reprocessar   x deletar   Esc volta".to_string(),
             Mode::Summary => {
                 let base = "d/w/m/y período   ←/→ navegar   ↑/↓   Enter detalhes   q sair";
                 if self.unprocessed_count > 0 {
@@ -400,12 +421,25 @@ impl Dashboard {
     }
 }
 
-/// Reparse every offline entry through Claude, in place. Returns how many
-/// succeeded; per-entry parse failures are skipped (they stay unprocessed).
-fn reprocess_all(path: &Path, parser: &dyn ActionParser) -> Result<usize> {
+/// Reparse entries through Claude, in place. `ids = None` reprocesses every
+/// offline entry; `Some(ids)` reprocesses those specific rows. Returns how many
+/// succeeded; per-entry parse failures are skipped.
+fn reprocess(path: &Path, parser: &dyn ActionParser, ids: Option<Vec<i64>>) -> Result<usize> {
     let store = Store::open(path)?;
+    let targets = match ids {
+        None => store.unprocessed()?,
+        Some(ids) => {
+            let mut found = Vec::new();
+            for id in ids {
+                if let Some(entry) = store.get(id)? {
+                    found.push(entry);
+                }
+            }
+            found
+        }
+    };
     let mut done = 0;
-    for entry in store.unprocessed()? {
+    for entry in targets {
         if let Ok(action) = parser.parse(&entry.raw_text) {
             store.update_processed(entry.id, &action.normalized())?;
             done += 1;

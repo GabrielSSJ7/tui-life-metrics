@@ -73,6 +73,25 @@ fn unprocessed_then_update_marks_processed() {
 }
 
 #[test]
+fn get_fetches_by_id_including_processed_and_offline() {
+    let path = temp_db("get");
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).unwrap();
+
+    let today = NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
+    let processed_id = store.insert("Corri 30min", &parsed("exercício", 14, 30.0)).unwrap();
+    let offline_id = store.insert_unprocessed("Algo offline", today).unwrap();
+
+    assert_eq!(store.get(processed_id).unwrap().unwrap().category, "exercício");
+    let offline = store.get(offline_id).unwrap().unwrap();
+    assert!(!offline.processed);
+    assert_eq!(offline.raw_text, "Algo offline");
+    assert!(store.get(9999).unwrap().is_none());
+
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn delete_removes_entry() {
     let path = temp_db("delete");
     let _ = std::fs::remove_file(&path);
