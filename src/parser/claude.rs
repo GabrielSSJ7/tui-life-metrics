@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{anyhow, Result};
@@ -15,10 +16,28 @@ pub struct ClaudeParser {
 
 impl Default for ClaudeParser {
     fn default() -> Self {
-        Self {
-            binary: "claude".to_string(),
+        Self { binary: resolve_binary() }
+    }
+}
+
+/// Locate the `claude` binary.
+///
+/// Window-manager keybinds (Hyprland/Omarchy) spawn the terminal with a minimal
+/// PATH that usually omits `~/.local/bin`, so a bare `"claude"` fails to resolve
+/// there even though it works in an interactive shell. Prefer an explicit path.
+///
+/// Order: `$TUI_LIFE_METRICS_CLAUDE` → `~/.local/bin/claude` → bare `claude` (PATH).
+fn resolve_binary() -> String {
+    if let Some(explicit) = std::env::var_os("TUI_LIFE_METRICS_CLAUDE") {
+        return explicit.to_string_lossy().into_owned();
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/claude");
+        if local.exists() {
+            return local.to_string_lossy().into_owned();
         }
     }
+    "claude".to_string()
 }
 
 impl ClaudeParser {
