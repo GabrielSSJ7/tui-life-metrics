@@ -41,7 +41,8 @@ fn open_store() -> Result<Store> {
 }
 
 fn dashboard() -> Result<()> {
-    ui::dashboard::run(open_store()?)
+    let parser: Arc<dyn ActionParser> = Arc::new(ClaudeParser::default());
+    ui::dashboard::run(open_store()?, parser, paths::db_path())
 }
 
 fn capture() -> Result<()> {

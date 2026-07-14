@@ -72,6 +72,34 @@ fn unprocessed_then_update_marks_processed() {
     std::fs::remove_file(&path).unwrap();
 }
 
+#[test]
+fn delete_removes_entry() {
+    let path = temp_db("delete");
+    let _ = std::fs::remove_file(&path);
+    let store = Store::open(&path).unwrap();
+
+    let id = store
+        .insert("Corri 30min", &parsed("exercício", 14, 30.0))
+        .unwrap();
+    store
+        .insert("Li um capítulo", &parsed("leitura", 14, 20.0))
+        .unwrap();
+
+    assert_eq!(store.delete(id).unwrap(), 1);
+    assert_eq!(store.delete(id).unwrap(), 0); // already gone
+
+    let all = store
+        .entries_between(
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].category, "leitura");
+
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// Small helper so the assertions above read cleanly.
 trait LenChecked {
     fn len_checked(self) -> usize;

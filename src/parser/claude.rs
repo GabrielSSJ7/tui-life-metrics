@@ -16,7 +16,9 @@ pub struct ClaudeParser {
 
 impl Default for ClaudeParser {
     fn default() -> Self {
-        Self { binary: resolve_binary() }
+        Self {
+            binary: resolve_binary(),
+        }
     }
 }
 

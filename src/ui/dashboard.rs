@@ -1,26 +1,40 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{Duration, Local, NaiveDate};
+use chrono::{Duration as ChronoDuration, Local, NaiveDate};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::metrics::{self, CategoryTotal};
 use crate::models::Entry;
+use crate::parser::ActionParser;
 use crate::period::{Granularity, Period};
 use crate::store::Store;
 
 /// Window used to compute day-streaks regardless of the viewed period.
 const STREAK_LOOKBACK_DAYS: i64 = 400;
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TICK: Duration = Duration::from_millis(90);
 
 /// Open the metrics dashboard, defaulting to the current month.
-pub fn run(store: Store) -> Result<()> {
+///
+/// `db_path` is where a background reprocess thread reopens the DB (the main
+/// [`Store`] connection stays on this thread), and `parser` reparses offline
+/// entries when the user presses `r`.
+pub fn run(store: Store, parser: Arc<dyn ActionParser>, db_path: PathBuf) -> Result<()> {
     let mut terminal = ratatui::init();
-    let result = Dashboard::new(store)?.run(&mut terminal);
+    let result = Dashboard::new(store, parser, db_path)?.run(&mut terminal);
     ratatui::restore();
     result
 }
@@ -32,30 +46,46 @@ enum Mode {
 
 struct Dashboard {
     store: Store,
+    parser: Arc<dyn ActionParser>,
+    db_path: PathBuf,
     today: NaiveDate,
     period: Period,
     current: Vec<Entry>,
     totals: Vec<CategoryTotal>,
     deltas: BTreeMap<String, i64>,
     streaks: BTreeMap<String, u32>,
+    unprocessed_count: usize,
     table: TableState,
     mode: Mode,
+    drill: ListState,
+    /// Id of the entry awaiting delete confirmation, if any.
+    pending_delete: Option<i64>,
+    /// Channel receiving the reprocess result while a background parse runs.
+    reprocess: Option<Receiver<Result<usize>>>,
+    spinner: usize,
     quit: bool,
 }
 
 impl Dashboard {
-    fn new(store: Store) -> Result<Self> {
+    fn new(store: Store, parser: Arc<dyn ActionParser>, db_path: PathBuf) -> Result<Self> {
         let today = Local::now().date_naive();
         let mut dash = Self {
             store,
+            parser,
+            db_path,
             today,
             period: Period::new(Granularity::Month, today),
             current: Vec::new(),
             totals: Vec::new(),
             deltas: BTreeMap::new(),
             streaks: BTreeMap::new(),
+            unprocessed_count: 0,
             table: TableState::default().with_selected(0),
             mode: Mode::Summary,
+            drill: ListState::default().with_selected(Some(0)),
+            pending_delete: None,
+            reprocess: None,
+            spinner: 0,
             quit: false,
         };
         dash.reload()?;
@@ -65,10 +95,33 @@ impl Dashboard {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
+            if self.reprocess.is_some() {
+                self.tick_reprocess()?;
+            } else if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    self.on_key(key.code)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-blocking cycle used while a background reprocess is running so the
+    /// spinner animates and input still responds.
+    fn tick_reprocess(&mut self) -> Result<()> {
+        if event::poll(TICK)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     self.on_key(key.code)?;
                 }
+            }
+        }
+        self.spinner = (self.spinner + 1) % SPINNER.len();
+        if let Some(rx) = &self.reprocess {
+            if let Ok(result) = rx.try_recv() {
+                result?;
+                self.reprocess = None;
+                self.reload()?;
             }
         }
         Ok(())
@@ -83,13 +136,14 @@ impl Dashboard {
         self.totals = metrics::totals_by_category(&self.current);
         self.deltas = metrics::count_delta(&self.current, &previous);
         self.streaks = self.compute_streaks()?;
+        self.unprocessed_count = self.current.iter().filter(|e| !e.processed).count();
         self.clamp_selection();
         Ok(())
     }
 
     fn compute_streaks(&self) -> Result<BTreeMap<String, u32>> {
         let recent = self.store.entries_between(
-            self.today - Duration::days(STREAK_LOOKBACK_DAYS),
+            self.today - ChronoDuration::days(STREAK_LOOKBACK_DAYS),
             self.today,
         )?;
         let mut by_cat: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
@@ -129,21 +183,79 @@ impl Dashboard {
             KeyCode::Char('w') => self.set_gran(Granularity::Week)?,
             KeyCode::Char('m') => self.set_gran(Granularity::Month)?,
             KeyCode::Char('y') => self.set_gran(Granularity::Year)?,
+            KeyCode::Char('r') => self.start_reprocess(),
             KeyCode::Left | KeyCode::Char('h') => self.shift(-1)?,
             KeyCode::Right | KeyCode::Char('l') => self.shift(1)?,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-            KeyCode::Enter if !self.totals.is_empty() => self.mode = Mode::Drill,
+            KeyCode::Enter if !self.totals.is_empty() => self.enter_drill(),
             _ => {}
         }
         Ok(())
     }
 
     fn on_drill_key(&mut self, code: KeyCode) -> Result<()> {
-        if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace) {
-            self.mode = Mode::Summary;
+        if self.pending_delete.is_some() {
+            return self.on_confirm_key(code);
+        }
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => self.mode = Mode::Summary,
+            KeyCode::Down | KeyCode::Char('j') => self.move_drill(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_drill(-1),
+            KeyCode::Char('x') | KeyCode::Delete => self.pending_delete = self.selected_drill_id(),
+            _ => {}
         }
         Ok(())
+    }
+
+    fn on_confirm_key(&mut self, code: KeyCode) -> Result<()> {
+        match code {
+            KeyCode::Char('y') => self.confirm_delete()?,
+            KeyCode::Char('n') | KeyCode::Esc => self.pending_delete = None,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Delete the pending entry, reload, and leave the drill if it emptied out.
+    fn confirm_delete(&mut self) -> Result<()> {
+        let Some(id) = self.pending_delete.take() else {
+            return Ok(());
+        };
+        self.store.delete(id)?;
+        self.reload()?;
+        let remaining = self.drill_entries().len();
+        if remaining == 0 {
+            self.mode = Mode::Summary;
+        } else {
+            let idx = self.drill.selected().unwrap_or(0).min(remaining - 1);
+            self.drill.select(Some(idx));
+        }
+        Ok(())
+    }
+
+    /// Spawn a background thread that reparses every offline entry via Claude.
+    ///
+    /// The thread opens its own DB connection (SQLite handles the concurrent
+    /// writes) so the UI thread's [`Store`] and event loop stay responsive.
+    fn start_reprocess(&mut self) {
+        if self.reprocess.is_some() || self.unprocessed_count == 0 {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let path = self.db_path.clone();
+        let parser = Arc::clone(&self.parser);
+        thread::spawn(move || {
+            let _ = tx.send(reprocess_all(&path, parser.as_ref()));
+        });
+        self.reprocess = Some(rx);
+        self.spinner = 0;
+    }
+
+    fn enter_drill(&mut self) {
+        self.mode = Mode::Drill;
+        self.drill.select(Some(0));
+        self.pending_delete = None;
     }
 
     fn set_gran(&mut self, gran: Granularity) -> Result<()> {
@@ -157,13 +269,17 @@ impl Dashboard {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.totals.is_empty() {
-            return;
+        let cur = self.table.selected().unwrap_or(0);
+        if let Some(next) = move_within(cur, self.totals.len(), delta) {
+            self.table.select(Some(next));
         }
-        let last = self.totals.len() - 1;
-        let cur = self.table.selected().unwrap_or(0) as isize;
-        let next = (cur + delta).clamp(0, last as isize) as usize;
-        self.table.select(Some(next));
+    }
+
+    fn move_drill(&mut self, delta: isize) {
+        let cur = self.drill.selected().unwrap_or(0);
+        if let Some(next) = move_within(cur, self.drill_entries().len(), delta) {
+            self.drill.select(Some(next));
+        }
     }
 
     fn selected_category(&self) -> Option<&str> {
@@ -171,6 +287,22 @@ impl Dashboard {
             .selected()
             .and_then(|i| self.totals.get(i))
             .map(|t| t.category.as_str())
+    }
+
+    /// Entries in the current period belonging to the selected category.
+    fn drill_entries(&self) -> Vec<&Entry> {
+        match self.selected_category() {
+            Some(cat) => self.current.iter().filter(|e| e.category == cat).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn selected_drill_id(&self) -> Option<i64> {
+        let entries = self.drill_entries();
+        self.drill
+            .selected()
+            .and_then(|i| entries.get(i))
+            .map(|e| e.id)
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -189,13 +321,32 @@ impl Dashboard {
             self.period.label(),
             self.period.gran.label()
         );
-        let hints = "d/w/m/y período   ←/→ navegar   ↑/↓ selecionar   Enter detalhes   q sair";
-        Paragraph::new(Line::from(hints))
+        Paragraph::new(Line::from(self.hint_text()))
             .style(Style::default().fg(Color::DarkGray))
             .block(Block::default().borders(Borders::ALL).title(title))
     }
 
-    fn draw_summary(&mut self, frame: &mut Frame, area: ratatui::layout::Rect) {
+    fn hint_text(&self) -> String {
+        if self.reprocess.is_some() {
+            return format!(
+                "{} reprocessando entradas offline com Claude…",
+                SPINNER[self.spinner]
+            );
+        }
+        match self.mode {
+            Mode::Drill => "↑/↓ mover   x deletar   Esc volta".to_string(),
+            Mode::Summary => {
+                let base = "d/w/m/y período   ←/→ navegar   ↑/↓   Enter detalhes   q sair";
+                if self.unprocessed_count > 0 {
+                    format!("{base}   r reprocessar ({})", self.unprocessed_count)
+                } else {
+                    base.to_string()
+                }
+            }
+        }
+    }
+
+    fn draw_summary(&mut self, frame: &mut Frame, area: Rect) {
         if self.totals.is_empty() {
             let empty = Paragraph::new("sem registros neste período")
                 .block(Block::default().borders(Borders::ALL));
@@ -229,19 +380,50 @@ impl Dashboard {
         ])
     }
 
-    fn draw_drill(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
-        let Some(category) = self.selected_category() else {
-            return;
-        };
-        let items: Vec<ListItem> = self
-            .current
-            .iter()
-            .filter(|e| e.category == category)
-            .map(drill_item)
-            .collect();
-        let title = format!(" {category} · {}   [Esc volta] ", self.period.label());
-        let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-        frame.render_widget(list, area);
+    fn draw_drill(&mut self, frame: &mut Frame, area: Rect) {
+        let title = self.drill_title();
+        let entries = self.drill_entries();
+        let items: Vec<ListItem> = entries.iter().map(|e| drill_item(e)).collect();
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("› ");
+        frame.render_stateful_widget(list, area, &mut self.drill);
+    }
+
+    fn drill_title(&self) -> String {
+        if self.pending_delete.is_some() {
+            return " deletar entrada selecionada? (y confirma / n cancela) ".to_string();
+        }
+        let category = self.selected_category().unwrap_or("");
+        format!(" {category} · {} ", self.period.label())
+    }
+}
+
+/// Reparse every offline entry through Claude, in place. Returns how many
+/// succeeded; per-entry parse failures are skipped (they stay unprocessed).
+fn reprocess_all(path: &Path, parser: &dyn ActionParser) -> Result<usize> {
+    let store = Store::open(path)?;
+    let mut done = 0;
+    for entry in store.unprocessed()? {
+        if let Ok(action) = parser.parse(&entry.raw_text) {
+            store.update_processed(entry.id, &action.normalized())?;
+            done += 1;
+        }
+    }
+    Ok(done)
+}
+
+/// Clamp `cur + delta` into `[0, len)`; `None` if the list is empty or unchanged.
+fn move_within(cur: usize, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let next = (cur as isize + delta).clamp(0, len as isize - 1) as usize;
+    if next == cur {
+        None
+    } else {
+        Some(next)
     }
 }
 

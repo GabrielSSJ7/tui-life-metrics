@@ -85,6 +85,14 @@ impl Store {
         let rows = stmt.query_map([], row_to_entry)?;
         collect(rows)
     }
+
+    /// Permanently remove an entry by id. Returns the number of rows deleted.
+    pub fn delete(&self, id: i64) -> Result<usize> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM entries WHERE id=?1", params![id])?;
+        Ok(removed)
+    }
 }
 
 fn opt(s: &str) -> Option<String> {
